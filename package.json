@@ -87,7 +87,7 @@
     "graphql-tag": "^2.12.3",
     "hoist-non-react-statics": "^3.3.2",
     "optimism": "^0.16.1",
-    "prop-types": "^15.7.2",
+    "prop-types": "^15.8.1",
     "symbol-observable": "^4.0.0",
     "ts-invariant": "^0.9.4",
     "tslib": "^2.3.0",

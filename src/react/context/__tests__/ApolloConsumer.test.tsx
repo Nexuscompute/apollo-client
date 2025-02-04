@@ -1,31 +1,26 @@
-import React from 'react';
-import { render, screen } from '@testing-library/react';
+import React from "react";
+import { render, screen } from "@testing-library/react";
 
-import { ApolloLink } from '../../../link/core';
-import { ApolloClient } from '../../../core';
-import { InMemoryCache as Cache } from '../../../cache';
-import { ApolloProvider } from '../ApolloProvider';
-import { ApolloConsumer } from '../ApolloConsumer';
-import { getApolloContext } from '../ApolloContext';
-import { itAsync } from '../../../testing';
+import { ApolloLink } from "../../../link/core";
+import { ApolloClient } from "../../../core";
+import { InMemoryCache as Cache } from "../../../cache";
+import { ApolloProvider } from "../ApolloProvider";
+import { ApolloConsumer } from "../ApolloConsumer";
+import { getApolloContext } from "../ApolloContext";
 
 const client = new ApolloClient({
   cache: new Cache(),
-  link: new ApolloLink((o, f) => (f ? f(o) : null))
+  link: new ApolloLink((o, f) => (f ? f(o) : null)),
 });
 
-describe('<ApolloConsumer /> component', () => {
-  itAsync('has a render prop', (resolve, reject) => {
+describe("<ApolloConsumer /> component", () => {
+  it("has a render prop", (done) => {
     render(
       <ApolloProvider client={client}>
         <ApolloConsumer>
-          {clientRender => {
-            try {
-              expect(clientRender).toBe(client);
-              resolve();
-            } catch (e) {
-              reject(e);
-            }
+          {(clientRender) => {
+            expect(clientRender).toBe(client);
+            done();
             return null;
           }}
         </ApolloConsumer>
@@ -33,17 +28,17 @@ describe('<ApolloConsumer /> component', () => {
     );
   });
 
-  it('renders the content in the children prop', () => {
+  it("renders the content in the children prop", () => {
     render(
       <ApolloProvider client={client}>
         <ApolloConsumer>{() => <div>Test</div>}</ApolloConsumer>
       </ApolloProvider>
     );
 
-    expect(screen.getByText('Test')).toBeTruthy();
+    expect(screen.getByText("Test")).toBeTruthy();
   });
 
-  it('errors if there is no client in the context', () => {
+  it("errors if there is no client in the context", () => {
     // Prevent Error about missing context type from appearing in the console.
     const errorLogger = console.error;
     console.error = () => {};

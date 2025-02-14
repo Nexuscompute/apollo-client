@@ -1,17 +1,28 @@
-import { invariant, InvariantError } from '../utilities/globals';
+import { invariant, newInvariantError } from "../utilities/globals/index.js";
 
-import { DocumentNode } from 'graphql';
+import type { DocumentNode } from "graphql";
 // TODO(brian): A hack until this issue is resolved (https://github.com/graphql/graphql-js/issues/3356)
 type OperationTypeNode = any;
-import { equal } from '@wry/equality';
+import { equal } from "@wry/equality";
 
-import { ApolloLink, execute, FetchResult } from '../link/core';
+import type { ApolloLink, FetchResult } from "../link/core/index.js";
+import { execute } from "../link/core/index.js";
 import {
+  addNonReactiveToNamedFragments,
+  defaultCacheSizes,
+  hasDirectives,
   isExecutionPatchIncrementalResult,
   isExecutionPatchResult,
-} from '../utilities/common/incrementalResult';
-import { Cache, ApolloCache, canonicalStringify } from '../cache';
+  isFullyUnmaskedOperation,
+  removeDirectivesFromDocument,
+} from "../utilities/index.js";
+import type { Cache, ApolloCache } from "../cache/index.js";
+import { canonicalStringify } from "../cache/index.js";
 
+import type {
+  ObservableSubscription,
+  ConcastSourcesArray,
+} from "../utilities/index.js";
 import {
   getDefaultValues,
   getOperationDefinition,
@@ -19,31 +30,33 @@ import {
   hasClientExports,
   graphQLResultHasError,
   getGraphQLErrorsFromResult,
-  removeConnectionDirectiveFromDocument,
-  canUseWeakMap,
-  ObservableSubscription,
   Observable,
   asyncMap,
   isNonEmptyArray,
   Concast,
-  ConcastSourcesArray,
   makeUniqueId,
   isDocumentNode,
   isNonNullObject,
-} from '../utilities';
-import { mergeIncrementalData } from '../utilities/common/incrementalResult';
-import { ApolloError, isApolloError, graphQLResultHasProtocolErrors } from '../errors';
+  DocumentTransform,
+} from "../utilities/index.js";
+import { mergeIncrementalData } from "../utilities/common/incrementalResult.js";
 import {
+  ApolloError,
+  isApolloError,
+  graphQLResultHasProtocolErrors,
+} from "../errors/index.js";
+import type {
   QueryOptions,
   WatchQueryOptions,
   SubscriptionOptions,
   MutationOptions,
   ErrorPolicy,
   MutationFetchPolicy,
-} from './watchQueryOptions';
-import { ObservableQuery, logMissingFieldErrors } from './ObservableQuery';
-import { NetworkStatus, isNetworkRequestInFlight } from './networkStatus';
-import {
+  WatchQueryFetchPolicy,
+} from "./watchQueryOptions.js";
+import { ObservableQuery, logMissingFieldErrors } from "./ObservableQuery.js";
+import { NetworkStatus, isNetworkRequestInFlight } from "./networkStatus.js";
+import type {
   ApolloQueryResult,
   OperationVariables,
   MutationUpdaterFunction,
@@ -52,18 +65,25 @@ import {
   InternalRefetchQueriesOptions,
   InternalRefetchQueriesResult,
   InternalRefetchQueriesMap,
-} from './types';
-import { LocalState } from './LocalState';
+  DefaultContext,
+} from "./types.js";
+import type { LocalState } from "./LocalState.js";
 
+import type { QueryStoreValue } from "./QueryInfo.js";
 import {
   QueryInfo,
-  QueryStoreValue,
   shouldWriteResult,
   CacheWriteBehavior,
-} from './QueryInfo';
-import { PROTOCOL_ERRORS_SYMBOL, ApolloErrorOptions } from '../errors';
+} from "./QueryInfo.js";
+import type { ApolloErrorOptions } from "../errors/index.js";
+import { PROTOCOL_ERRORS_SYMBOL } from "../errors/index.js";
+import { print } from "../utilities/index.js";
+import type { IgnoreModifier } from "../cache/core/types/common.js";
+import type { TODO } from "../utilities/types/TODO.js";
 
 const { hasOwnProperty } = Object.prototype;
+
+const IGNORE: IgnoreModifier = Object.create(null);
 
 interface MutationStoreValue {
   mutation: DocumentNode;
@@ -75,16 +95,49 @@ interface MutationStoreValue {
 type UpdateQueries<TData> = MutationOptions<TData, any, any>["updateQueries"];
 
 interface TransformCacheEntry {
-  document: DocumentNode;
   hasClientExports: boolean;
   hasForcedResolvers: boolean;
+  hasNonreactiveDirective: boolean;
+  nonReactiveQuery: DocumentNode;
   clientQuery: DocumentNode | null;
   serverQuery: DocumentNode | null;
   defaultVars: OperationVariables;
   asQuery: DocumentNode;
 }
 
-type DefaultOptions = import("./ApolloClient").DefaultOptions;
+import type { DefaultOptions } from "./ApolloClient.js";
+import { Trie } from "@wry/trie";
+import { AutoCleanedWeakCache, cacheSizes } from "../utilities/index.js";
+import { maskFragment, maskOperation } from "../masking/index.js";
+import type { MaybeMasked, Unmasked } from "../masking/index.js";
+
+interface MaskFragmentOptions<TData> {
+  fragment: DocumentNode;
+  data: TData;
+  fragmentName?: string;
+}
+
+interface MaskOperationOptions<TData> {
+  document: DocumentNode;
+  data: TData;
+  id: string;
+  fetchPolicy?: WatchQueryFetchPolicy;
+}
+
+export interface QueryManagerOptions<TStore> {
+  cache: ApolloCache<TStore>;
+  link: ApolloLink;
+  defaultOptions: DefaultOptions;
+  documentTransform: DocumentTransform | null | undefined;
+  queryDeduplication: boolean;
+  onBroadcast: undefined | (() => void);
+  ssrMode: boolean;
+  clientAwareness: Record<string, string>;
+  localState: LocalState<TStore>;
+  assumeImmutableResults: boolean;
+  defaultContext: Partial<DefaultContext> | undefined;
+  dataMasking: boolean;
+}
 
 export class QueryManager<TStore> {
   public cache: ApolloCache<TStore>;
@@ -92,7 +145,10 @@ export class QueryManager<TStore> {
   public defaultOptions: DefaultOptions;
 
   public readonly assumeImmutableResults: boolean;
+  public readonly documentTransform: DocumentTransform;
   public readonly ssrMode: boolean;
+  public readonly defaultContext: Partial<DefaultContext>;
+  public readonly dataMasking: boolean;
 
   private queryDeduplication: boolean;
   private clientAwareness: Record<string, string> = {};
@@ -109,38 +165,40 @@ export class QueryManager<TStore> {
 
   // Maps from queryId strings to Promise rejection functions for
   // currently active queries and fetches.
-  private fetchCancelFns = new Map<string, (error: any) => any>();
+  // Use protected instead of private field so
+  // @apollo/experimental-nextjs-app-support can access type info.
+  protected fetchCancelFns = new Map<string, (error: any) => any>();
 
-  constructor({
-    cache,
-    link,
-    defaultOptions,
-    queryDeduplication = false,
-    onBroadcast,
-    ssrMode = false,
-    clientAwareness = {},
-    localState,
-    assumeImmutableResults,
-  }: {
-    cache: ApolloCache<TStore>;
-    link: ApolloLink;
-    defaultOptions?: DefaultOptions;
-    queryDeduplication?: boolean;
-    onBroadcast?: () => void;
-    ssrMode?: boolean;
-    clientAwareness?: Record<string, string>;
-    localState?: LocalState<TStore>;
-    assumeImmutableResults?: boolean;
-  }) {
-    this.cache = cache;
-    this.link = link;
-    this.defaultOptions = defaultOptions || Object.create(null);
-    this.queryDeduplication = queryDeduplication;
-    this.clientAwareness = clientAwareness;
-    this.localState = localState || new LocalState({ cache });
-    this.ssrMode = ssrMode;
-    this.assumeImmutableResults = !!assumeImmutableResults;
-    if ((this.onBroadcast = onBroadcast)) {
+  constructor(options: QueryManagerOptions<TStore>) {
+    const defaultDocumentTransform = new DocumentTransform(
+      (document) => this.cache.transformDocument(document),
+      // Allow the apollo cache to manage its own transform caches
+      { cache: false }
+    );
+
+    this.cache = options.cache;
+    this.link = options.link;
+    this.defaultOptions = options.defaultOptions;
+    this.queryDeduplication = options.queryDeduplication;
+    this.clientAwareness = options.clientAwareness;
+    this.localState = options.localState;
+    this.ssrMode = options.ssrMode;
+    this.assumeImmutableResults = options.assumeImmutableResults;
+    this.dataMasking = options.dataMasking;
+    const documentTransform = options.documentTransform;
+    this.documentTransform =
+      documentTransform ?
+        defaultDocumentTransform
+          .concat(documentTransform)
+          // The custom document transform may add new fragment spreads or new
+          // field selections, so we want to give the cache a chance to run
+          // again. For example, the InMemoryCache adds __typename to field
+          // selections and fragments from the fragment registry.
+          .concat(defaultDocumentTransform)
+      : defaultDocumentTransform;
+    this.defaultContext = options.defaultContext || Object.create(null);
+
+    if ((this.onBroadcast = options.onBroadcast)) {
       this.mutationStore = Object.create(null);
     }
   }
@@ -155,12 +213,12 @@ export class QueryManager<TStore> {
     });
 
     this.cancelPendingFetches(
-      new InvariantError('QueryManager stopped while query was in flight'),
+      newInvariantError("QueryManager stopped while query was in flight")
     );
   }
 
   private cancelPendingFetches(error: Error) {
-    this.fetchCancelFns.forEach(cancel => cancel(error));
+    this.fetchCancelFns.forEach((cancel) => cancel(error));
     this.fetchCancelFns.clear();
   }
 
@@ -168,7 +226,7 @@ export class QueryManager<TStore> {
     TData,
     TVariables extends OperationVariables,
     TContext extends Record<string, any>,
-    TCache extends ApolloCache<any>
+    TCache extends ApolloCache<any>,
   >({
     mutation,
     variables,
@@ -182,29 +240,31 @@ export class QueryManager<TStore> {
     errorPolicy = this.defaultOptions.mutate?.errorPolicy || "none",
     keepRootFields,
     context,
-  }: MutationOptions<TData, TVariables, TContext>): Promise<FetchResult<TData>> {
+  }: MutationOptions<TData, TVariables, TContext>): Promise<
+    FetchResult<MaybeMasked<TData>>
+  > {
     invariant(
       mutation,
-      'mutation option is required. You must specify your GraphQL document in the mutation option.',
+      "mutation option is required. You must specify your GraphQL document in the mutation option."
     );
 
     invariant(
-      fetchPolicy === 'network-only' ||
-      fetchPolicy === 'no-cache',
+      fetchPolicy === "network-only" || fetchPolicy === "no-cache",
       "Mutations support only 'network-only' or 'no-cache' fetchPolicy strings. The default `network-only` behavior automatically writes mutation results to the cache. Passing `no-cache` skips the cache write."
     );
 
     const mutationId = this.generateMutationId();
 
-    const {
-      document,
-      hasClientExports,
-    } = this.transform(mutation);
-    mutation = this.cache.transformForLink(document);
+    mutation = this.cache.transformForLink(this.transform(mutation));
+    const { hasClientExports } = this.getDocumentInfo(mutation);
 
     variables = this.getVariables(mutation, variables) as TVariables;
     if (hasClientExports) {
-      variables = await this.localState.addExportedVariables(mutation, variables, context) as TVariables;
+      variables = (await this.localState.addExportedVariables(
+        mutation,
+        variables,
+        context
+      )) as TVariables;
     }
 
     const mutationStoreValue =
@@ -216,24 +276,22 @@ export class QueryManager<TStore> {
         error: null,
       } as MutationStoreValue);
 
-    if (optimisticResponse) {
-      this.markMutationOptimistic<
-        TData,
-        TVariables,
-        TContext,
-        TCache
-      >(optimisticResponse, {
-        mutationId,
-        document: mutation,
-        variables,
-        fetchPolicy,
-        errorPolicy,
-        context,
-        updateQueries,
-        update: updateWithProxyFn,
-        keepRootFields,
-      });
-    }
+    const isOptimistic =
+      optimisticResponse &&
+      this.markMutationOptimistic<TData, TVariables, TContext, TCache>(
+        optimisticResponse,
+        {
+          mutationId,
+          document: mutation,
+          variables,
+          fetchPolicy,
+          errorPolicy,
+          context,
+          updateQueries,
+          update: updateWithProxyFn,
+          keepRootFields,
+        }
+      );
 
     this.broadcastQueries();
 
@@ -245,14 +303,15 @@ export class QueryManager<TStore> {
           mutation,
           {
             ...context,
-            optimisticResponse,
+            optimisticResponse: isOptimistic ? optimisticResponse : void 0,
           },
           variables,
-          false,
+          {},
+          false
         ),
 
         (result: FetchResult<TData>) => {
-          if (graphQLResultHasError(result) && errorPolicy === 'none') {
+          if (graphQLResultHasError(result) && errorPolicy === "none") {
             throw new ApolloError({
               graphQLErrors: getGraphQLErrorsFromResult(result),
             });
@@ -266,20 +325,16 @@ export class QueryManager<TStore> {
           const storeResult: typeof result = { ...result };
 
           if (typeof refetchQueries === "function") {
-            refetchQueries = refetchQueries(storeResult);
+            refetchQueries = refetchQueries(
+              storeResult as FetchResult<Unmasked<TData>>
+            );
           }
 
-          if (errorPolicy === 'ignore' &&
-              graphQLResultHasError(storeResult)) {
+          if (errorPolicy === "ignore" && graphQLResultHasError(storeResult)) {
             delete storeResult.errors;
           }
 
-          return self.markMutationResult<
-            TData,
-            TVariables,
-            TContext,
-            TCache
-          >({
+          return self.markMutationResult<TData, TVariables, TContext, TCache>({
             mutationId,
             result: storeResult,
             document: mutation,
@@ -291,12 +346,11 @@ export class QueryManager<TStore> {
             updateQueries,
             awaitRefetchQueries,
             refetchQueries,
-            removeOptimistic: optimisticResponse ? mutationId : void 0,
+            removeOptimistic: isOptimistic ? mutationId : void 0,
             onQueryUpdated,
             keepRootFields,
           });
-        },
-
+        }
       ).subscribe({
         next(storeResult) {
           self.broadcastQueries();
@@ -306,8 +360,16 @@ export class QueryManager<TStore> {
           // we resolve with a SingleExecutionResult or after the final
           // ExecutionPatchResult has arrived and we have assembled the
           // multipart response into a single result.
-          if (!('hasNext' in storeResult) || storeResult.hasNext === false) {
-            resolve(storeResult);
+          if (!("hasNext" in storeResult) || storeResult.hasNext === false) {
+            resolve({
+              ...storeResult,
+              data: self.maskOperation({
+                document: mutation,
+                data: storeResult.data,
+                fetchPolicy,
+                id: mutationId,
+              }) as any,
+            });
           }
         },
 
@@ -317,16 +379,18 @@ export class QueryManager<TStore> {
             mutationStoreValue.error = err;
           }
 
-          if (optimisticResponse) {
+          if (isOptimistic) {
             self.cache.removeOptimistic(mutationId);
           }
 
           self.broadcastQueries();
 
           reject(
-            err instanceof ApolloError ? err : new ApolloError({
-              networkError: err,
-            }),
+            err instanceof ApolloError ? err : (
+              new ApolloError({
+                networkError: err,
+              })
+            )
           );
         },
       });
@@ -337,7 +401,7 @@ export class QueryManager<TStore> {
     TData,
     TVariables,
     TContext,
-    TCache extends ApolloCache<any>
+    TCache extends ApolloCache<any>,
   >(
     mutation: {
       mutationId: string;
@@ -355,7 +419,7 @@ export class QueryManager<TStore> {
       onQueryUpdated?: OnQueryUpdated<any>;
       keepRootFields?: boolean;
     },
-    cache = this.cache,
+    cache = this.cache
   ): Promise<FetchResult<TData>> {
     let { result } = mutation;
     const cacheWrites: Cache.WriteOptions[] = [];
@@ -365,18 +429,21 @@ export class QueryManager<TStore> {
       if (!isExecutionPatchIncrementalResult(result)) {
         cacheWrites.push({
           result: result.data,
-          dataId: 'ROOT_MUTATION',
+          dataId: "ROOT_MUTATION",
           query: mutation.document,
           variables: mutation.variables,
         });
       }
-      if (isExecutionPatchIncrementalResult(result) && isNonEmptyArray(result.incremental)) {
+      if (
+        isExecutionPatchIncrementalResult(result) &&
+        isNonEmptyArray(result.incremental)
+      ) {
         const diff = cache.diff<TData>({
           id: "ROOT_MUTATION",
           // The cache complains if passed a mutation where it expects a
           // query, so we transform mutations and subscriptions to queries
           // (only once, thanks to this.transformCache).
-          query: this.transform(mutation.document).asQuery,
+          query: this.getDocumentInfo(mutation.document).asQuery,
           variables: mutation.variables,
           optimistic: false,
           returnPartialData: true,
@@ -385,16 +452,16 @@ export class QueryManager<TStore> {
         if (diff.result) {
           mergedData = mergeIncrementalData(diff.result, result);
         }
-        if (typeof mergedData !== 'undefined') {
+        if (typeof mergedData !== "undefined") {
           // cast the ExecutionPatchResult to FetchResult here since
           // ExecutionPatchResult never has `data` when returned from the server
           (result as FetchResult).data = mergedData;
           cacheWrites.push({
             result: mergedData,
-            dataId: 'ROOT_MUTATION',
+            dataId: "ROOT_MUTATION",
             query: mutation.document,
             variables: mutation.variables,
-          })
+          });
         }
       }
 
@@ -419,8 +486,8 @@ export class QueryManager<TStore> {
           if (complete && currentQueryResult) {
             // Run our reducer using the current query result and the mutation result.
             const nextQueryResult = updater(currentQueryResult, {
-              mutationResult: result,
-              queryName: document && getOperationName(document) || void 0,
+              mutationResult: result as FetchResult<Unmasked<TData>>,
+              queryName: (document && getOperationName(document)) || void 0,
               queryVariables: variables!,
             });
 
@@ -428,7 +495,7 @@ export class QueryManager<TStore> {
             if (nextQueryResult) {
               cacheWrites.push({
                 result: nextQueryResult,
-                dataId: 'ROOT_QUERY',
+                dataId: "ROOT_QUERY",
                 query: document!,
                 variables,
               });
@@ -440,7 +507,7 @@ export class QueryManager<TStore> {
 
     if (
       cacheWrites.length > 0 ||
-      mutation.refetchQueries ||
+      (mutation.refetchQueries || "").length > 0 ||
       mutation.update ||
       mutation.onQueryUpdated ||
       mutation.removeOptimistic
@@ -448,9 +515,9 @@ export class QueryManager<TStore> {
       const results: any[] = [];
 
       this.refetchQueries({
-        updateCache: (cache: TCache) => {
+        updateCache: (cache) => {
           if (!skipCache) {
-            cacheWrites.forEach(write => cache.write(write));
+            cacheWrites.forEach((write) => cache.write(write));
           }
 
           // If the mutation has some writes associated with it then we need to
@@ -474,18 +541,18 @@ export class QueryManager<TStore> {
                 // The cache complains if passed a mutation where it expects a
                 // query, so we transform mutations and subscriptions to queries
                 // (only once, thanks to this.transformCache).
-                query: this.transform(mutation.document).asQuery,
+                query: this.getDocumentInfo(mutation.document).asQuery,
                 variables: mutation.variables,
                 optimistic: false,
                 returnPartialData: true,
               });
 
               if (diff.complete) {
-                result = { ...result as FetchResult, data: diff.result };
-                if ('incremental' in result) {
+                result = { ...(result as FetchResult), data: diff.result };
+                if ("incremental" in result) {
                   delete result.incremental;
                 }
-                if ('hasNext' in result) {
+                if ("hasNext" in result) {
                   delete result.hasNext;
                 }
               }
@@ -495,7 +562,7 @@ export class QueryManager<TStore> {
             // either a SingleExecutionResult or the final ExecutionPatchResult,
             // call the update function.
             if (isFinalResult) {
-              update(cache, result, {
+              update(cache as TCache, result as FetchResult<Unmasked<TData>>, {
                 context: mutation.context,
                 variables: mutation.variables,
               });
@@ -506,7 +573,7 @@ export class QueryManager<TStore> {
           // shallow to allow rolling back optimistic evictions.
           if (!skipCache && !mutation.keepRootFields && isFinalResult) {
             cache.modify({
-              id: 'ROOT_MUTATION',
+              id: "ROOT_MUTATION",
               fields(value, { fieldName, DELETE }) {
                 return fieldName === "__typename" ? value : DELETE;
               },
@@ -528,8 +595,7 @@ export class QueryManager<TStore> {
         // If no onQueryUpdated function was provided for this mutation, pass
         // null instead of undefined to disable the default refetching behavior.
         onQueryUpdated: mutation.onQueryUpdated || null,
-
-      }).forEach(result => results.push(result));
+      }).forEach((result) => results.push(result));
 
       if (mutation.awaitRefetchQueries || mutation.onQueryUpdated) {
         // Returning a promise here makes the mutation await that promise, so we
@@ -542,7 +608,12 @@ export class QueryManager<TStore> {
     return Promise.resolve(result);
   }
 
-  public markMutationOptimistic<TData, TVariables, TContext, TCache extends ApolloCache<any>>(
+  public markMutationOptimistic<
+    TData,
+    TVariables,
+    TContext,
+    TCache extends ApolloCache<any>,
+  >(
     optimisticResponse: any,
     mutation: {
       mutationId: string;
@@ -551,37 +622,44 @@ export class QueryManager<TStore> {
       fetchPolicy?: MutationFetchPolicy;
       errorPolicy: ErrorPolicy;
       context?: TContext;
-      updateQueries: UpdateQueries<TData>,
+      updateQueries: UpdateQueries<TData>;
       update?: MutationUpdaterFunction<TData, TVariables, TContext, TCache>;
-      keepRootFields?: boolean,
-    },
+      keepRootFields?: boolean;
+    }
   ) {
-    const data = typeof optimisticResponse === "function"
-      ? optimisticResponse(mutation.variables)
+    const data =
+      typeof optimisticResponse === "function" ?
+        optimisticResponse(mutation.variables, { IGNORE })
       : optimisticResponse;
 
-    return this.cache.recordOptimisticTransaction(cache => {
+    if (data === IGNORE) {
+      return false;
+    }
+
+    this.cache.recordOptimisticTransaction((cache) => {
       try {
-        this.markMutationResult<TData, TVariables, TContext, TCache>({
-          ...mutation,
-          result: { data },
-        }, cache);
+        this.markMutationResult<TData, TVariables, TContext, TCache>(
+          {
+            ...mutation,
+            result: { data },
+          },
+          cache
+        );
       } catch (error) {
         invariant.error(error);
       }
     }, mutation.mutationId);
+
+    return true;
   }
 
   public fetchQuery<TData, TVars extends OperationVariables>(
     queryId: string,
     options: WatchQueryOptions<TVars, TData>,
-    networkStatus?: NetworkStatus,
+    networkStatus?: NetworkStatus
   ): Promise<ApolloQueryResult<TData>> {
-    return this.fetchQueryObservable<TData, TVars>(
-      queryId,
-      options,
-      networkStatus,
-    ).promise;
+    return this.fetchConcastWithInfo(queryId, options, networkStatus).concast
+      .promise as TODO;
   }
 
   public getQueryStore() {
@@ -605,56 +683,62 @@ export class QueryManager<TStore> {
     }
   }
 
-  private transformCache = new (
-    canUseWeakMap ? WeakMap : Map
-  )<DocumentNode, TransformCacheEntry>();
-
   public transform(document: DocumentNode) {
+    return this.documentTransform.transformDocument(document);
+  }
+
+  private transformCache = new AutoCleanedWeakCache<
+    DocumentNode,
+    TransformCacheEntry
+  >(
+    cacheSizes["queryManager.getDocumentInfo"] ||
+      defaultCacheSizes["queryManager.getDocumentInfo"]
+  );
+
+  public getDocumentInfo(document: DocumentNode) {
     const { transformCache } = this;
 
     if (!transformCache.has(document)) {
-      const transformed = this.cache.transformDocument(document);
-      const noConnection = removeConnectionDirectiveFromDocument(transformed);
-      const clientQuery = this.localState.clientQuery(transformed);
-      const serverQuery = noConnection && this.localState.serverQuery(noConnection);
-
       const cacheEntry: TransformCacheEntry = {
-        document: transformed,
-        // TODO These two calls (hasClientExports and shouldForceResolvers)
-        // could probably be merged into a single traversal.
-        hasClientExports: hasClientExports(transformed),
-        hasForcedResolvers: this.localState.shouldForceResolvers(transformed),
-        clientQuery,
-        serverQuery,
+        // TODO These three calls (hasClientExports, shouldForceResolvers, and
+        // usesNonreactiveDirective) are performing independent full traversals
+        // of the transformed document. We should consider merging these
+        // traversals into a single pass in the future, though the work is
+        // cached after the first time.
+        hasClientExports: hasClientExports(document),
+        hasForcedResolvers: this.localState.shouldForceResolvers(document),
+        hasNonreactiveDirective: hasDirectives(["nonreactive"], document),
+        nonReactiveQuery: addNonReactiveToNamedFragments(document),
+        clientQuery: this.localState.clientQuery(document),
+        serverQuery: removeDirectivesFromDocument(
+          [
+            { name: "client", remove: true },
+            { name: "connection" },
+            { name: "nonreactive" },
+            { name: "unmask" },
+          ],
+          document
+        ),
         defaultVars: getDefaultValues(
-          getOperationDefinition(transformed)
+          getOperationDefinition(document)
         ) as OperationVariables,
         // Transform any mutation or subscription operations to query operations
         // so we can read/write them from/to the cache.
         asQuery: {
-          ...transformed,
-          definitions: transformed.definitions.map(def => {
-            if (def.kind === "OperationDefinition" &&
-                def.operation !== "query") {
+          ...document,
+          definitions: document.definitions.map((def) => {
+            if (
+              def.kind === "OperationDefinition" &&
+              def.operation !== "query"
+            ) {
               return { ...def, operation: "query" as OperationTypeNode };
             }
             return def;
           }),
-        }
+        },
       };
 
-      const add = (doc: DocumentNode | null) => {
-        if (doc && !transformCache.has(doc)) {
-          transformCache.set(doc, cacheEntry);
-        }
-      }
-      // Add cacheEntry to the transformCache using several different keys,
-      // since any one of these documents could end up getting passed to the
-      // transform method again in the future.
-      add(document);
-      add(transformed);
-      add(clientQuery);
-      add(serverQuery);
+      transformCache.set(document, cacheEntry);
     }
 
     return transformCache.get(document)!;
@@ -662,27 +746,29 @@ export class QueryManager<TStore> {
 
   private getVariables<TVariables>(
     document: DocumentNode,
-    variables?: TVariables,
+    variables?: TVariables
   ): OperationVariables {
     return {
-      ...this.transform(document).defaultVars,
+      ...this.getDocumentInfo(document).defaultVars,
       ...variables,
     };
   }
 
-  public watchQuery<T, TVariables extends OperationVariables = OperationVariables>(
-    options: WatchQueryOptions<TVariables, T>,
-  ): ObservableQuery<T, TVariables> {
+  public watchQuery<
+    T,
+    TVariables extends OperationVariables = OperationVariables,
+  >(options: WatchQueryOptions<TVariables, T>): ObservableQuery<T, TVariables> {
+    const query = this.transform(options.query);
+
     // assign variable default values if supplied
+    // NOTE: We don't modify options.query here with the transformed query to
+    // ensure observable.options.query is set to the raw untransformed query.
     options = {
       ...options,
-      variables: this.getVariables(
-        options.query,
-        options.variables,
-      ) as TVariables,
+      variables: this.getVariables(query, options.variables) as TVariables,
     };
 
-    if (typeof options.notifyOnNetworkStatusChange === 'undefined') {
+    if (typeof options.notifyOnNetworkStatusChange === "undefined") {
       options.notifyOnNetworkStatusChange = false;
     }
 
@@ -692,11 +778,14 @@ export class QueryManager<TStore> {
       queryInfo,
       options,
     });
+    observable["lastQuery"] = query;
 
     this.queries.set(observable.queryId, queryInfo);
 
+    // We give queryInfo the transformed query to ensure the first cache diff
+    // uses the transformed query instead of the raw query
     queryInfo.init({
-      document: observable.query,
+      document: query,
       observableQuery: observable,
       variables: observable.variables,
     });
@@ -706,33 +795,45 @@ export class QueryManager<TStore> {
 
   public query<TData, TVars extends OperationVariables = OperationVariables>(
     options: QueryOptions<TVars, TData>,
-    queryId = this.generateQueryId(),
-  ): Promise<ApolloQueryResult<TData>> {
+    queryId = this.generateQueryId()
+  ): Promise<ApolloQueryResult<MaybeMasked<TData>>> {
     invariant(
       options.query,
-      'query option is required. You must specify your GraphQL document ' +
-        'in the query option.',
+      "query option is required. You must specify your GraphQL document " +
+        "in the query option."
     );
 
     invariant(
-      options.query.kind === 'Document',
-      'You must wrap the query string in a "gql" tag.',
+      options.query.kind === "Document",
+      'You must wrap the query string in a "gql" tag.'
     );
 
     invariant(
       !(options as any).returnPartialData,
-      'returnPartialData option only supported on watchQuery.',
+      "returnPartialData option only supported on watchQuery."
     );
 
     invariant(
       !(options as any).pollInterval,
-      'pollInterval option only supported on watchQuery.',
+      "pollInterval option only supported on watchQuery."
     );
 
-    return this.fetchQuery<TData, TVars>(
-      queryId,
-      options,
-    ).finally(() => this.stopQuery(queryId));
+    const query = this.transform(options.query);
+
+    return this.fetchQuery<TData, TVars>(queryId, { ...options, query })
+      .then(
+        (result) =>
+          result && {
+            ...result,
+            data: this.maskOperation({
+              document: query,
+              data: result.data,
+              fetchPolicy: options.fetchPolicy,
+              id: queryId,
+            }),
+          }
+      )
+      .finally(() => this.stopQuery(queryId));
   }
 
   private queryIdCounter = 1;
@@ -760,19 +861,23 @@ export class QueryManager<TStore> {
     if (queryInfo) queryInfo.stop();
   }
 
-  public clearStore(options: Cache.ResetOptions = {
-    discardWatches: true,
-  }): Promise<void> {
+  public clearStore(
+    options: Cache.ResetOptions = {
+      discardWatches: true,
+    }
+  ): Promise<void> {
     // Before we have sent the reset action to the store, we can no longer
     // rely on the results returned by in-flight requests since these may
     // depend on values that previously existed in the data portion of the
     // store. So, we cancel the promises and observers that we have issued
     // so far and not yet resolved (in the case of queries).
-    this.cancelPendingFetches(new InvariantError(
-      'Store reset while query was in flight (not completed in link chain)',
-    ));
+    this.cancelPendingFetches(
+      newInvariantError(
+        "Store reset while query was in flight (not completed in link chain)"
+      )
+    );
 
-    this.queries.forEach(queryInfo => {
+    this.queries.forEach((queryInfo) => {
       if (queryInfo.observableQuery) {
         // Set loading to true so listeners don't trigger unless they want
         // results with partial data.
@@ -791,18 +896,22 @@ export class QueryManager<TStore> {
   }
 
   public getObservableQueries(
-    include: InternalRefetchQueriesInclude = "active",
+    include: InternalRefetchQueriesInclude = "active"
   ) {
     const queries = new Map<string, ObservableQuery<any>>();
-    const queryNamesAndDocs = new Map<string | DocumentNode, boolean>();
+    const queryNames = new Map<string, string | null>();
+    const queryNamesAndQueryStrings = new Map<string, boolean>();
     const legacyQueryOptions = new Set<QueryOptions>();
 
     if (Array.isArray(include)) {
-      include.forEach(desc => {
+      include.forEach((desc) => {
         if (typeof desc === "string") {
-          queryNamesAndDocs.set(desc, false);
+          queryNames.set(desc, desc);
+          queryNamesAndQueryStrings.set(desc, false);
         } else if (isDocumentNode(desc)) {
-          queryNamesAndDocs.set(this.transform(desc).document, false);
+          const queryString = print(this.transform(desc));
+          queryNames.set(queryString, getOperationName(desc));
+          queryNamesAndQueryStrings.set(queryString, false);
         } else if (isNonNullObject(desc) && desc.query) {
           legacyQueryOptions.add(desc);
         }
@@ -830,12 +939,12 @@ export class QueryManager<TStore> {
 
         if (
           include === "active" ||
-          (queryName && queryNamesAndDocs.has(queryName)) ||
-          (document && queryNamesAndDocs.has(document))
+          (queryName && queryNamesAndQueryStrings.has(queryName)) ||
+          (document && queryNamesAndQueryStrings.has(print(document)))
         ) {
           queries.set(queryId, oq);
-          if (queryName) queryNamesAndDocs.set(queryName, true);
-          if (document) queryNamesAndDocs.set(document, true);
+          if (queryName) queryNamesAndQueryStrings.set(queryName, true);
+          if (document) queryNamesAndQueryStrings.set(print(document), true);
         }
       }
     });
@@ -864,14 +973,21 @@ export class QueryManager<TStore> {
       });
     }
 
-    if (__DEV__ && queryNamesAndDocs.size) {
-      queryNamesAndDocs.forEach((included, nameOrDoc) => {
+    if (__DEV__ && queryNamesAndQueryStrings.size) {
+      queryNamesAndQueryStrings.forEach((included, nameOrQueryString) => {
         if (!included) {
-          invariant.warn(`Unknown query ${
-            typeof nameOrDoc === "string" ? "named " : ""
-          }${
-            JSON.stringify(nameOrDoc, null, 2)
-          } requested in refetchQueries options.include array`);
+          const queryName = queryNames.get(nameOrQueryString);
+
+          if (queryName) {
+            invariant.warn(
+              `Unknown query named "%s" requested in refetchQueries options.include array`,
+              queryName
+            );
+          } else {
+            invariant.warn(
+              `Unknown anonymous query requested in refetchQueries options.include array`
+            );
+          }
         }
       });
     }
@@ -880,22 +996,23 @@ export class QueryManager<TStore> {
   }
 
   public reFetchObservableQueries(
-    includeStandby: boolean = false,
+    includeStandby: boolean = false
   ): Promise<ApolloQueryResult<any>[]> {
     const observableQueryPromises: Promise<ApolloQueryResult<any>>[] = [];
 
-    this.getObservableQueries(
-      includeStandby ? "all" : "active"
-    ).forEach((observableQuery, queryId) => {
-      const { fetchPolicy } = observableQuery.options;
-      observableQuery.resetLastResults();
-      if (includeStandby ||
-          (fetchPolicy !== "standby" &&
-           fetchPolicy !== "cache-only")) {
-        observableQueryPromises.push(observableQuery.refetch());
+    this.getObservableQueries(includeStandby ? "all" : "active").forEach(
+      (observableQuery, queryId) => {
+        const { fetchPolicy } = observableQuery.options;
+        observableQuery.resetLastResults();
+        if (
+          includeStandby ||
+          (fetchPolicy !== "standby" && fetchPolicy !== "cache-only")
+        ) {
+          observableQueryPromises.push(observableQuery.refetch());
+        }
+        this.getQuery(queryId).setDiff(null);
       }
-      this.getQuery(queryId).setDiff(null);
-    });
+    );
 
     this.broadcastQueries();
 
@@ -906,65 +1023,75 @@ export class QueryManager<TStore> {
     this.getQuery(observableQuery.queryId).setObservableQuery(observableQuery);
   }
 
-  public startGraphQLSubscription<T = any>({
-    query,
-    fetchPolicy,
-    errorPolicy,
-    variables,
-    context = {},
-  }: SubscriptionOptions): Observable<FetchResult<T>> {
-    query = this.transform(query).document;
+  public startGraphQLSubscription<T = any>(
+    options: SubscriptionOptions
+  ): Observable<FetchResult<T>> {
+    let { query, variables } = options;
+    const {
+      fetchPolicy,
+      errorPolicy = "none",
+      context = {},
+      extensions = {},
+    } = options;
+
+    query = this.transform(query);
     variables = this.getVariables(query, variables);
 
     const makeObservable = (variables: OperationVariables) =>
-      this.getObservableFromLink<T>(
-        query,
-        context,
-        variables,
-      ).map(result => {
-        if (fetchPolicy !== 'no-cache') {
-          // the subscription interface should handle not sending us results we no longer subscribe to.
-          // XXX I don't think we ever send in an object with errors, but we might in the future...
-          if (shouldWriteResult(result, errorPolicy)) {
-            this.cache.write({
-              query,
-              result: result.data,
-              dataId: 'ROOT_SUBSCRIPTION',
-              variables: variables,
-            });
+      this.getObservableFromLink<T>(query, context, variables, extensions).map(
+        (result) => {
+          if (fetchPolicy !== "no-cache") {
+            // the subscription interface should handle not sending us results we no longer subscribe to.
+            // XXX I don't think we ever send in an object with errors, but we might in the future...
+            if (shouldWriteResult(result, errorPolicy)) {
+              this.cache.write({
+                query,
+                result: result.data,
+                dataId: "ROOT_SUBSCRIPTION",
+                variables: variables,
+              });
+            }
+
+            this.broadcastQueries();
           }
 
-          this.broadcastQueries();
+          const hasErrors = graphQLResultHasError(result);
+          const hasProtocolErrors = graphQLResultHasProtocolErrors(result);
+          if (hasErrors || hasProtocolErrors) {
+            const errors: ApolloErrorOptions = {};
+            if (hasErrors) {
+              errors.graphQLErrors = result.errors;
+            }
+            if (hasProtocolErrors) {
+              errors.protocolErrors = result.extensions[PROTOCOL_ERRORS_SYMBOL];
+            }
+
+            // `errorPolicy` is a mechanism for handling GraphQL errors, according
+            // to our documentation, so we throw protocol errors regardless of the
+            // set error policy.
+            if (errorPolicy === "none" || hasProtocolErrors) {
+              throw new ApolloError(errors);
+            }
+          }
+
+          if (errorPolicy === "ignore") {
+            delete result.errors;
+          }
+
+          return result;
         }
+      );
 
-        const hasErrors = graphQLResultHasError(result);
-        const hasProtocolErrors = graphQLResultHasProtocolErrors(result);
-        if (hasErrors || hasProtocolErrors) {
-          const errors: ApolloErrorOptions = {};
-          if (hasErrors) {
-            errors.graphQLErrors = result.errors;
-          }
-          if (hasProtocolErrors) {
-            errors.protocolErrors = result.extensions[PROTOCOL_ERRORS_SYMBOL];
-          }
-          throw new ApolloError(errors);
-        }
+    if (this.getDocumentInfo(query).hasClientExports) {
+      const observablePromise = this.localState
+        .addExportedVariables(query, variables, context)
+        .then(makeObservable);
 
-        return result;
-      });
-
-    if (this.transform(query).hasClientExports) {
-      const observablePromise = this.localState.addExportedVariables(
-        query,
-        variables,
-        context,
-      ).then(makeObservable);
-
-      return new Observable<FetchResult<T>>(observer => {
+      return new Observable<FetchResult<T>>((observer) => {
         let sub: ObservableSubscription | null = null;
         observablePromise.then(
-          observable => sub = observable.subscribe(observer),
-          observer.error,
+          (observable) => (sub = observable.subscribe(observer)),
+          observer.error
         );
         return () => sub && sub.unsubscribe();
       });
@@ -998,30 +1125,31 @@ export class QueryManager<TStore> {
 
   public broadcastQueries() {
     if (this.onBroadcast) this.onBroadcast();
-    this.queries.forEach(info => info.notify());
+    this.queries.forEach((info) => info.notify());
   }
 
   public getLocalState(): LocalState<TStore> {
     return this.localState;
   }
 
-  private inFlightLinkObservables = new Map<
-    DocumentNode,
-    Map<string, Observable<FetchResult>>
-  >();
+  // Use protected instead of private field so
+  // @apollo/experimental-nextjs-app-support can access type info.
+  protected inFlightLinkObservables = new Trie<{
+    observable?: Observable<FetchResult<any>>;
+  }>(false);
 
   private getObservableFromLink<T = any>(
     query: DocumentNode,
     context: any,
     variables?: OperationVariables,
-    deduplication: boolean =
-      // Prefer context.queryDeduplication if specified.
-      context?.queryDeduplication ??
-      this.queryDeduplication,
+    extensions?: Record<string, any>,
+    // Prefer context.queryDeduplication if specified.
+    deduplication: boolean = context?.queryDeduplication ??
+      this.queryDeduplication
   ): Observable<FetchResult<T>> {
-    let observable: Observable<FetchResult<T>>;
+    let observable: Observable<FetchResult<T>> | undefined;
 
-    const { serverQuery } = this.transform(query);
+    const { serverQuery, clientQuery } = this.getDocumentInfo(query);
     if (serverQuery) {
       const { inFlightLinkObservables, link } = this;
 
@@ -1031,49 +1159,49 @@ export class QueryManager<TStore> {
         operationName: getOperationName(serverQuery) || void 0,
         context: this.prepareContext({
           ...context,
-          forceFetch: !deduplication
+          forceFetch: !deduplication,
         }),
+        extensions,
       };
 
       context = operation.context;
 
       if (deduplication) {
-        const byVariables = inFlightLinkObservables.get(serverQuery) || new Map();
-        inFlightLinkObservables.set(serverQuery, byVariables);
-
+        const printedServerQuery = print(serverQuery);
         const varJson = canonicalStringify(variables);
-        observable = byVariables.get(varJson);
 
+        const entry = inFlightLinkObservables.lookup(
+          printedServerQuery,
+          varJson
+        );
+
+        observable = entry.observable;
         if (!observable) {
           const concast = new Concast([
-            execute(link, operation) as Observable<FetchResult<T>>
+            execute(link, operation) as Observable<FetchResult<T>>,
           ]);
+          observable = entry.observable = concast;
 
-          byVariables.set(varJson, observable = concast);
-
-          concast.beforeNext(() => {
-            if (byVariables.delete(varJson) &&
-                byVariables.size < 1) {
-              inFlightLinkObservables.delete(serverQuery);
+          concast.beforeNext(function cb(method, arg: FetchResult) {
+            if (method === "next" && "hasNext" in arg && arg.hasNext) {
+              concast.beforeNext(cb);
+            } else {
+              inFlightLinkObservables.remove(printedServerQuery, varJson);
             }
           });
         }
-
       } else {
         observable = new Concast([
-          execute(link, operation) as Observable<FetchResult<T>>
+          execute(link, operation) as Observable<FetchResult<T>>,
         ]);
       }
     } else {
-      observable = new Concast([
-        Observable.of({ data: {} } as FetchResult<T>)
-      ]);
+      observable = new Concast([Observable.of({ data: {} } as FetchResult<T>)]);
       context = this.prepareContext(context);
     }
 
-    const { clientQuery } = this.transform(query);
     if (clientQuery) {
-      observable = asyncMap(observable, result => {
+      observable = asyncMap(observable, (result) => {
         return this.localState.runResolvers({
           document: clientQuery,
           remoteResult: result,
@@ -1089,46 +1217,50 @@ export class QueryManager<TStore> {
   private getResultsFromLink<TData, TVars extends OperationVariables>(
     queryInfo: QueryInfo,
     cacheWriteBehavior: CacheWriteBehavior,
-    options: Pick<WatchQueryOptions<TVars, TData>,
-      | "variables"
-      | "context"
-      | "fetchPolicy"
-      | "errorPolicy">,
+    options: Pick<
+      WatchQueryOptions<TVars, TData>,
+      "query" | "variables" | "context" | "fetchPolicy" | "errorPolicy"
+    >
   ): Observable<ApolloQueryResult<TData>> {
-    const requestId = queryInfo.lastRequestId = this.generateRequestId();
+    const requestId = (queryInfo.lastRequestId = this.generateRequestId());
 
     // Performing transformForLink here gives this.cache a chance to fill in
     // missing fragment definitions (for example) before sending this document
     // through the link chain.
-    const linkDocument = this.cache.transformForLink(
-      // Use same document originally produced by this.cache.transformDocument.
-      this.transform(queryInfo.document!).document
-    );
+    const linkDocument = this.cache.transformForLink(options.query);
 
     return asyncMap(
       this.getObservableFromLink(
         linkDocument,
         options.context,
-        options.variables,
+        options.variables
       ),
 
-      result => {
+      (result) => {
         const graphQLErrors = getGraphQLErrorsFromResult(result);
         const hasErrors = graphQLErrors.length > 0;
+        const { errorPolicy } = options;
 
         // If we interrupted this request by calling getResultsFromLink again
         // with the same QueryInfo object, we ignore the old results.
         if (requestId >= queryInfo.lastRequestId) {
-          if (hasErrors && options.errorPolicy === "none") {
+          if (hasErrors && errorPolicy === "none") {
             // Throwing here effectively calls observer.error.
-            throw queryInfo.markError(new ApolloError({
-              graphQLErrors,
-            }));
+            throw queryInfo.markError(
+              new ApolloError({
+                graphQLErrors,
+              })
+            );
           }
           // Use linkDocument rather than queryInfo.document so the
           // operation/fragments used to write the result are the same as the
           // ones used to obtain it from the link.
-          queryInfo.markResult(result, linkDocument, options, cacheWriteBehavior);
+          queryInfo.markResult(
+            result,
+            linkDocument,
+            options,
+            cacheWriteBehavior
+          );
           queryInfo.markReady();
         }
 
@@ -1138,7 +1270,15 @@ export class QueryManager<TStore> {
           networkStatus: NetworkStatus.ready,
         };
 
-        if (hasErrors && options.errorPolicy !== "ignore") {
+        // In the case we start multiple network requests simulatenously, we
+        // want to ensure we properly set `data` if we're reporting on an old
+        // result which will not be caught by the conditional above that ends up
+        // throwing the markError result.
+        if (hasErrors && errorPolicy === "none") {
+          aqr.data = void 0 as TData;
+        }
+
+        if (hasErrors && errorPolicy !== "ignore") {
           aqr.errors = graphQLErrors;
           aqr.networkStatus = NetworkStatus.error;
         }
@@ -1146,10 +1286,11 @@ export class QueryManager<TStore> {
         return aqr;
       },
 
-      networkError => {
-        const error = isApolloError(networkError)
-          ? networkError
-          : new ApolloError({ networkError });
+      (networkError) => {
+        const error =
+          isApolloError(networkError) ? networkError : (
+            new ApolloError({ networkError })
+          );
 
         // Avoid storing errors from older interrupted queries.
         if (requestId >= queryInfo.lastRequestId) {
@@ -1157,23 +1298,8 @@ export class QueryManager<TStore> {
         }
 
         throw error;
-      },
+      }
     );
-  }
-
-  public fetchQueryObservable<TData, TVars extends OperationVariables>(
-    queryId: string,
-    options: WatchQueryOptions<TVars, TData>,
-    // The initial networkStatus for this fetch, most often
-    // NetworkStatus.loading, but also possibly fetchMore, poll, refetch,
-    // or setVariables.
-    networkStatus?: NetworkStatus,
-  ): Concast<ApolloQueryResult<TData>> {
-    return this.fetchConcastWithInfo(
-      queryId,
-      options,
-      networkStatus,
-    ).concast;
   }
 
   private fetchConcastWithInfo<TData, TVars extends OperationVariables>(
@@ -1182,16 +1308,16 @@ export class QueryManager<TStore> {
     // The initial networkStatus for this fetch, most often
     // NetworkStatus.loading, but also possibly fetchMore, poll, refetch,
     // or setVariables.
-    networkStatus = NetworkStatus.loading
+    networkStatus = NetworkStatus.loading,
+    query = options.query
   ): ConcastAndInfo<TData> {
-    const query = this.transform(options.query).document;
     const variables = this.getVariables(query, options.variables) as TVars;
     const queryInfo = this.getQuery(queryId);
 
     const defaults = this.defaultOptions.watchQuery;
     let {
-      fetchPolicy = defaults && defaults.fetchPolicy || "cache-first",
-      errorPolicy = defaults && defaults.errorPolicy || "none",
+      fetchPolicy = (defaults && defaults.fetchPolicy) || "cache-first",
+      errorPolicy = (defaults && defaults.errorPolicy) || "none",
       returnPartialData = false,
       notifyOnNetworkStatusChange = false,
       context = {},
@@ -1216,7 +1342,7 @@ export class QueryManager<TStore> {
       const sourcesWithInfo = this.fetchQueryByPolicy<TData, TVars>(
         queryInfo,
         normalized,
-        networkStatus,
+        networkStatus
       );
 
       if (
@@ -1228,7 +1354,10 @@ export class QueryManager<TStore> {
         sourcesWithInfo.sources.length > 0 &&
         queryInfo.observableQuery
       ) {
-        queryInfo.observableQuery["applyNextFetchPolicy"]("after-fetch", options);
+        queryInfo.observableQuery["applyNextFetchPolicy"](
+          "after-fetch",
+          options
+        );
       }
 
       return sourcesWithInfo;
@@ -1237,14 +1366,14 @@ export class QueryManager<TStore> {
     // This cancel function needs to be set before the concast is created,
     // in case concast creation synchronously cancels the request.
     const cleanupCancelFn = () => this.fetchCancelFns.delete(queryId);
-    this.fetchCancelFns.set(queryId, reason => {
+    this.fetchCancelFns.set(queryId, (reason) => {
       cleanupCancelFn();
       // This delay ensures the concast variable has been initialized.
       setTimeout(() => concast.cancel(reason));
     });
 
     let concast: Concast<ApolloQueryResult<TData>>,
-        containsDataFromLink: boolean;
+      containsDataFromLink: boolean;
     // If the query has @export(as: ...) directives, then we need to
     // process those directives asynchronously. When there are no
     // @export directives (the common case), we deliberately avoid
@@ -1252,11 +1381,16 @@ export class QueryManager<TStore> {
     // since the timing of result delivery is (unfortunately) important
     // for backwards compatibility. TODO This code could be simpler if
     // we deprecated and removed LocalState.
-    if (this.transform(normalized.query).hasClientExports) {
+    if (this.getDocumentInfo(normalized.query).hasClientExports) {
       concast = new Concast(
         this.localState
-          .addExportedVariables(normalized.query, normalized.variables, normalized.context)
-          .then(fromVariables).then(sourcesWithInfo => sourcesWithInfo.sources),
+          .addExportedVariables(
+            normalized.query,
+            normalized.variables,
+            normalized.context
+          )
+          .then(fromVariables)
+          .then((sourcesWithInfo) => sourcesWithInfo.sources)
       );
       // there is just no way we can synchronously get the *right* value here,
       // so we will assume `true`, which is the behaviour before the bug fix in
@@ -1284,13 +1418,18 @@ export class QueryManager<TStore> {
     optimistic = false,
     removeOptimistic = optimistic ? makeUniqueId("refetchQueries") : void 0,
     onQueryUpdated,
-  }: InternalRefetchQueriesOptions<ApolloCache<TStore>, TResult>
-  ): InternalRefetchQueriesMap<TResult> {
-    const includedQueriesById = new Map<string, {
-      oq: ObservableQuery<any>;
-      lastDiff?: Cache.DiffResult<any>;
-      diff?: Cache.DiffResult<any>;
-    }>();
+  }: InternalRefetchQueriesOptions<
+    ApolloCache<TStore>,
+    TResult
+  >): InternalRefetchQueriesMap<TResult> {
+    const includedQueriesById = new Map<
+      string,
+      {
+        oq: ObservableQuery<any>;
+        lastDiff?: Cache.DiffResult<any>;
+        diff?: Cache.DiffResult<any>;
+      }
+    >();
 
     if (include) {
       this.getObservableQueries(include).forEach((oq, queryId) => {
@@ -1301,7 +1440,7 @@ export class QueryManager<TStore> {
       });
     }
 
-    const results: InternalRefetchQueriesMap<TResult> = new Map;
+    const results: InternalRefetchQueriesMap<TResult> = new Map();
 
     if (updateCache) {
       this.cache.batch({
@@ -1336,7 +1475,7 @@ export class QueryManager<TStore> {
         // only the root layer by passing optimistic: false to refetchQueries,
         // or you can read/write a brand new optimistic layer that will be
         // automatically removed by passing optimistic: true.
-        optimistic: optimistic && removeOptimistic || false,
+        optimistic: (optimistic && removeOptimistic) || false,
 
         // The removeOptimistic option can also be provided by itself, even if
         // optimistic === false, to remove some previously-added optimistic
@@ -1349,8 +1488,7 @@ export class QueryManager<TStore> {
 
         onWatchUpdated(watch, diff, lastDiff) {
           const oq =
-            watch.watcher instanceof QueryInfo &&
-            watch.watcher.observableQuery;
+            watch.watcher instanceof QueryInfo && watch.watcher.observableQuery;
 
           if (oq) {
             if (onQueryUpdated) {
@@ -1371,7 +1509,10 @@ export class QueryManager<TStore> {
               // Record the result in the results Map, as long as onQueryUpdated
               // did not return false to skip/ignore this result.
               if (result !== false) {
-                results.set(oq, result as InternalRefetchQueriesResult<TResult>);
+                results.set(
+                  oq,
+                  result as InternalRefetchQueriesResult<TResult>
+                );
               }
 
               // Allow the default cache broadcast to happen, except when
@@ -1392,7 +1533,11 @@ export class QueryManager<TStore> {
 
     if (includedQueriesById.size) {
       includedQueriesById.forEach(({ oq, lastDiff, diff }, queryId) => {
-        let result: TResult | boolean | Promise<ApolloQueryResult<any>> | undefined;
+        let result:
+          | TResult
+          | boolean
+          | Promise<ApolloQueryResult<any>>
+          | undefined;
 
         // If onQueryUpdated is provided, we want to use it for all included
         // queries, even the QueryOptions ones.
@@ -1434,9 +1579,52 @@ export class QueryManager<TStore> {
     return results;
   }
 
+  private noCacheWarningsByQueryId = new Set<string>();
+
+  public maskOperation<TData = unknown>(
+    options: MaskOperationOptions<TData>
+  ): MaybeMasked<TData> {
+    const { document, data } = options;
+
+    if (__DEV__) {
+      const { fetchPolicy, id } = options;
+      const operationType = getOperationDefinition(document)?.operation;
+      const operationId = (operationType?.[0] ?? "o") + id;
+
+      if (
+        this.dataMasking &&
+        fetchPolicy === "no-cache" &&
+        !isFullyUnmaskedOperation(document) &&
+        !this.noCacheWarningsByQueryId.has(operationId)
+      ) {
+        this.noCacheWarningsByQueryId.add(operationId);
+
+        invariant.warn(
+          '[%s]: Fragments masked by data masking are inaccessible when using fetch policy "no-cache". Please add `@unmask` to each fragment spread to access the data.',
+          getOperationName(document) ??
+            `Unnamed ${operationType ?? "operation"}`
+        );
+      }
+    }
+
+    return (
+      this.dataMasking ?
+        maskOperation(data, document, this.cache)
+      : data) as MaybeMasked<TData>;
+  }
+
+  public maskFragment<TData = unknown>(options: MaskFragmentOptions<TData>) {
+    const { data, fragment, fragmentName } = options;
+
+    return this.dataMasking ?
+        maskFragment(data, fragment, this.cache, fragmentName)
+      : data;
+  }
+
   private fetchQueryByPolicy<TData, TVars extends OperationVariables>(
     queryInfo: QueryInfo,
-    { query,
+    {
+      query,
       variables,
       fetchPolicy,
       refetchWritePolicy,
@@ -1453,40 +1641,41 @@ export class QueryManager<TStore> {
     const oldNetworkStatus = queryInfo.networkStatus;
 
     queryInfo.init({
-      document: this.transform(query).document,
+      document: query,
       variables,
       networkStatus,
     });
 
-    const readCache = () => queryInfo.getDiff(variables);
+    const readCache = () => queryInfo.getDiff();
 
     const resultsFromCache = (
       diff: Cache.DiffResult<TData>,
-      networkStatus = queryInfo.networkStatus || NetworkStatus.loading,
+      networkStatus = queryInfo.networkStatus || NetworkStatus.loading
     ) => {
       const data = diff.result;
 
-      if (__DEV__ &&
-          !returnPartialData &&
-          !equal(data, {})) {
+      if (__DEV__ && !returnPartialData && !equal(data, {})) {
         logMissingFieldErrors(diff.missing);
       }
 
-      const fromData = (data: TData | undefined) => Observable.of({
-        data,
-        loading: isNetworkRequestInFlight(networkStatus),
-        networkStatus,
-        ...(diff.complete ? null : { partial: true }),
-      } as ApolloQueryResult<TData>);
+      const fromData = (data: TData | undefined) =>
+        Observable.of({
+          data,
+          loading: isNetworkRequestInFlight(networkStatus),
+          networkStatus,
+          ...(diff.complete ? null : { partial: true }),
+        } as ApolloQueryResult<TData>);
 
-      if (data && this.transform(query).hasForcedResolvers) {
-        return this.localState.runResolvers({
-          document: query,
-          remoteResult: { data },
-          context,
-          variables,
-          onlyRunForcedResolvers: true,
-        }).then(resolved => fromData(resolved.data || void 0));
+      if (data && this.getDocumentInfo(query).hasForcedResolvers) {
+        return this.localState
+          .runResolvers({
+            document: query,
+            remoteResult: { data },
+            context,
+            variables,
+            onlyRunForcedResolvers: true,
+          })
+          .then((resolved) => fromData(resolved.data || void 0));
       }
 
       // Resolves https://github.com/apollographql/apollo-client/issues/10317.
@@ -1494,7 +1683,7 @@ export class QueryManager<TStore> {
       // data was incorrectly returned from the cache on refetch:
       // if diff.missing exists, we should not return cache data.
       if (
-        errorPolicy === 'none' &&
+        errorPolicy === "none" &&
         networkStatus === NetworkStatus.refetch &&
         Array.isArray(diff.missing)
       ) {
@@ -1505,24 +1694,24 @@ export class QueryManager<TStore> {
     };
 
     const cacheWriteBehavior =
-      fetchPolicy === "no-cache" ? CacheWriteBehavior.FORBID :
-      ( // Watched queries must opt into overwriting existing data on refetch,
+      fetchPolicy === "no-cache" ? CacheWriteBehavior.FORBID
+        // Watched queries must opt into overwriting existing data on refetch,
         // by passing refetchWritePolicy: "overwrite" in their WatchQueryOptions.
+      : (
         networkStatus === NetworkStatus.refetch &&
         refetchWritePolicy !== "merge"
-      ) ? CacheWriteBehavior.OVERWRITE
-        : CacheWriteBehavior.MERGE;
+      ) ?
+        CacheWriteBehavior.OVERWRITE
+      : CacheWriteBehavior.MERGE;
 
-    const resultsFromLink = () => this.getResultsFromLink<TData, TVars>(
-      queryInfo,
-      cacheWriteBehavior,
-      {
+    const resultsFromLink = () =>
+      this.getResultsFromLink<TData, TVars>(queryInfo, cacheWriteBehavior, {
+        query,
         variables,
         context,
         fetchPolicy,
         errorPolicy,
-      },
-    );
+      });
 
     const shouldNotify =
       notifyOnNetworkStatusChange &&
@@ -1531,15 +1720,22 @@ export class QueryManager<TStore> {
       isNetworkRequestInFlight(networkStatus);
 
     switch (fetchPolicy) {
-      default:  case "cache-first": {
+      default:
+      case "cache-first": {
         const diff = readCache();
 
         if (diff.complete) {
-          return { fromLink: false, sources: [resultsFromCache(diff, queryInfo.markReady())] };
+          return {
+            fromLink: false,
+            sources: [resultsFromCache(diff, queryInfo.markReady())],
+          };
         }
 
         if (returnPartialData || shouldNotify) {
-          return { fromLink: true, sources: [resultsFromCache(diff), resultsFromLink()] };
+          return {
+            fromLink: true,
+            sources: [resultsFromCache(diff), resultsFromLink()],
+          };
         }
 
         return { fromLink: true, sources: [resultsFromLink()] };
@@ -1549,18 +1745,27 @@ export class QueryManager<TStore> {
         const diff = readCache();
 
         if (diff.complete || returnPartialData || shouldNotify) {
-          return { fromLink: true, sources: [resultsFromCache(diff), resultsFromLink()] };
+          return {
+            fromLink: true,
+            sources: [resultsFromCache(diff), resultsFromLink()],
+          };
         }
 
         return { fromLink: true, sources: [resultsFromLink()] };
       }
 
       case "cache-only":
-        return { fromLink: false, sources: [resultsFromCache(readCache(), queryInfo.markReady())] };
+        return {
+          fromLink: false,
+          sources: [resultsFromCache(readCache(), queryInfo.markReady())],
+        };
 
       case "network-only":
         if (shouldNotify) {
-          return { fromLink: true, sources: [resultsFromCache(readCache()), resultsFromLink()] };
+          return {
+            fromLink: true,
+            sources: [resultsFromCache(readCache()), resultsFromLink()],
+          };
         }
 
         return { fromLink: true, sources: [resultsFromLink()] };
@@ -1572,10 +1777,7 @@ export class QueryManager<TStore> {
             // Note that queryInfo.getDiff() for no-cache queries does not call
             // cache.diff, but instead returns a { complete: false } stub result
             // when there is no queryInfo.diff already defined.
-            sources: [
-              resultsFromCache(queryInfo.getDiff()),
-              resultsFromLink(),
-            ],
+            sources: [resultsFromCache(queryInfo.getDiff()), resultsFromLink()],
           };
         }
 
@@ -1596,6 +1798,7 @@ export class QueryManager<TStore> {
   private prepareContext(context = {}) {
     const newContext = this.localState.prepareContext(context);
     return {
+      ...this.defaultContext,
       ...newContext,
       clientAwareness: this.clientAwareness,
     };
